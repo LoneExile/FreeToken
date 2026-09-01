@@ -3,11 +3,13 @@
 Native HIP backend for this fork. **ZLUDA is not supported**
 ([FlashML-org/FreeToken#60](https://github.com/FlashML-org/FreeToken/issues/60)).
 
-First-class target: **Linux x86_64, 2× AMD Radeon AI PRO R9700, RDNA 4, `gfx1201`**.
+First-class target: **Linux x86_64, AMD Radeon AI PRO R9700, RDNA 4, `gfx1201`**.
+This slice adds **one-card DeepSeek-V4-Flash-0731** (`--moe-backend offload`).
+Dual-card TP remains leftover.
 
 This cloud / CI environment does **not** have an R9700. The checks below that
 need a GPU must be run on the workstation. Nothing in this document invents
-tok/s or unpublished numbers.
+tok/s or unpublished numbers. **R9700 tok/s is not published.**
 
 ## What this PR does vs leftover
 
@@ -16,9 +18,9 @@ tok/s or unpublished numbers.
 | Detect AMD vs NVIDIA (`ft gpu`); hide Granite Ridge iGPU | Dual-card TP / RCCL not validated |
 | HIP JIT of tvm-ffi kernels (`index`, `store`, `fast_index_copy`, …) for `gfx1201` | Vulkan (community: the hard problem) |
 | HIP `host_register` / `device_ptr` (#122 TDR fix) | Full e2e on R9700 (must run locally) |
-| Attention auto → `triton`; NVIDIA cubin backends fail loudly | Qwen3.8-27B FP8 / NVFP4 fused donors; DSV4/MLA/BSA (need NVIDIA cubins) |
+| HIP attention: `triton` aliases `dsv4_sparse` / `dsa` / `m3_sparse` / `qsa_sparse` (already Triton; no flashinfer/sgl cubins) | Native HIP FP8 tensor cores (e4m3 **emulated** unless `FREETOKEN_HIP_E4M3_NATIVE=1`) |
 | GGUF HIP compile (`-DUSE_ROCM`, `--offload-arch`) + rocThrust shim | gfx1201 HIP **graph replay** (TDR on Windows #82) |
-| MoE `offload` / `fused` / `cpu` with Triton experts | Windows ROCm (see community forks) |
+| MoE `offload` / `fused` / `cpu` with Triton experts; DSV4 `ds_fp4` host banks | `--moe-backend hybrid`; Windows ROCm |
 
 Default on `gfx1201`: `--cuda-graph-max-bs 0` unless you set
 `FREETOKEN_HIP_GRAPH_REPLAY=1`. That is conservative — Linux replay on this SKU
@@ -62,6 +64,7 @@ is AMD and the vars are unset):
 | `FREETOKEN_HIP_GRAPH_REPLAY` | `1` | try CUDA-graph replay on gfx1201 |
 | `FREETOKEN_SKIP_CUDA_EXT` | `1` | skip install-time C++ ext; HIP ctypes fallback still registers host memory |
 | `FREETOKEN_GPU_VENDOR` | `amd` | force vendor in tests / odd wheels |
+| `FREETOKEN_HIP_E4M3_NATIVE` | `1` | try Triton native fp8e4nv on HIP (default: emulate) |
 
 ```bash
 ft gpu
@@ -72,6 +75,42 @@ ft gpu
 
 A Ryzen 9 9950X iGPU (`AMD Radeon Graphics` / `gfx1036`) is hidden so it does
 not become device 0. Strix Halo is **not** hidden.
+
+## DeepSeek-V4-Flash-0731 (one R9700, experts in host RAM)
+
+The in-tree DSV4 path is already Triton (`dsv4_sparse` + `kernel/triton/dsv4/*`).
+On HIP, `--attention-backend triton` remaps to `dsv4_sparse`. Do **not** use
+flashinfer / sgl / trtllm.
+
+Expert pool (from `_BANK_BYTES_PER_EXPERT["ds_fp4"]`, not a benchmark):
+
+- Shape: `H=4096`, `I=2048`, 43 layers, 256 experts, 6 active.
+- Bytes per expert-layer: `2*I*(H/2 + H/32) + H*(I/2 + I/32)` = 13 369 344 (~12.75 MiB).
+- Full host banks: `43 × 256 × 13 369 344` = **147 169 738 752 B ≈ 137.1 GiB**.
+- Fits ~192 GB system RAM with headroom for OS + KV + activations. One 32 GB
+  R9700 holds the resident (non-expert) path + a GPU expert slot cache.
+
+```bash
+export FREETOKEN_GFX_ARCH=gfx1201
+# Hide the 9950X iGPU (default). One card:
+ft serve --model deepseek-ai/DeepSeek-V4-Flash-0731 \
+  --moe-backend offload \
+  --attention-backend triton \
+  --cuda-graph-max-bs 0
+```
+
+`--gpu 0` if `ft gpu` still lists the iGPU. If HIP init hangs, see
+[ROCm#6630](https://github.com/ROCm/ROCm/issues/6630) (2026-08-28 RDNA4 bring-up);
+collect `rocminfo` / `dmesg` and stay on eager + `triton`.
+
+### One-card checklist (R9700 — not faked in CI)
+
+1. `ft gpu`: one R9700 `gfx1201`; Granite Ridge iGPU hidden.
+2. Host free RAM ≳ 160 GB before load (137 GiB banks + workspace).
+3. Command above reaches READY (no CUDA-symbol crash; no flashinfer/sgl).
+4. One `chat/completions` with `max_tokens=16` returns text.
+5. Optional: `FREETOKEN_HIP_GRAPH_REPLAY=1` — leftover, report Linux stability.
+6. Do **not** record tok/s as a published number.
 
 ## Minimal generate / serve (on the R9700)
 
@@ -93,12 +132,13 @@ ft serve --model <moe-or-gguf> --moe-backend offload --attention-backend triton 
 
 ### What you must run on the R9700 (not faked in CI)
 
-1. `ft gpu` lists both R9700s as `gfx1201`; iGPU absent or marked hidden.
+1. `ft gpu` lists the R9700 as `gfx1201`; iGPU absent or marked hidden.
 2. `ft serve` on a small dense model reaches READY and returns a completion.
 3. Same with `--moe-backend offload` on a small/supported MoE or GGUF (no TDR).
-4. Optional: `FREETOKEN_HIP_GRAPH_REPLAY=1` — report whether graph replay is
+4. DSV4-Flash-0731 one-card checklist above.
+5. Optional: `FREETOKEN_HIP_GRAPH_REPLAY=1` — report whether graph replay is
    stable on **Linux** gfx1201 (Windows #82 said no for MoE).
-5. Optional second card: `--gpu 0,1` / TP — leftover, say what happened.
+6. Optional second card: `--gpu 0,1` / TP — leftover, say what happened.
 
 ## Adding another gfx
 
