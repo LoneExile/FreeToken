@@ -22,7 +22,7 @@ tok/s or unpublished numbers. **R9700 tok/s is not published.**
 | GGUF HIP compile (`-DUSE_ROCM`, `--offload-arch`) + rocThrust shim | gfx1201 HIP **graph replay** (TDR on Windows #82) |
 | MoE `offload` / `fused` / `cpu` with Triton experts; DSV4 `ds_fp4` host banks | `--moe-backend hybrid`; Windows ROCm |
 | `--gpu 0,1` infers TP=2; HIP uses **RCCL** (`torch.distributed` backend `rccl` or the ROCm `nccl` alias). PyNCCL / NCCL 2.27 is NVIDIA-only and fails loudly on HIP | RCCL P2P / dual-card generate on this SKU (vLLM RCCL was reported fragile; not claimed here) |
-| Shared file-backed expert banks (`FREETOKEN_BANK_SHARE_DIR`) so TP ranks do not each mmap ~137 GiB | Rank-0-only bank fill (both ranks still read the checkpoint); FTW `HostBank()` path is still per-process |
+| Shared file-backed expert banks (`FREETOKEN_BANK_SHARE_DIR`, default `$XDG_CACHE_HOME/freetoken/banks-{port}` / `~/.cache/...` — **not** `/tmp`) | Rank-0-only bank fill; FTW `HostBank()` still anonymous-mmaps **2×137 GiB** on TP=2 |
 | Dense models that already call `LinearOProj` / `LinearRowParallel` all-reduce via `TorchDistributedImpl` on HIP | DSV4 `Linear` / MLA head **sharding** (today: replicate resident weights + full Triton `n_heads`) |
 
 Default on `gfx1201`: `--cuda-graph-max-bs 0` unless you set
@@ -69,7 +69,7 @@ is AMD and the vars are unset):
 | `FREETOKEN_GPU_VENDOR` | `amd` | force vendor in tests / odd wheels |
 | `FREETOKEN_HIP_E4M3_NATIVE` | `1` | try Triton native fp8e4nv on HIP (default: emulate) |
 | `NCCL_IB_DISABLE` | `1` (auto on HIP TP>1 if unset) | RCCL still reads `NCCL_*` names. Dual-card desktops have no InfiniBand; leaving IB on can stall init. Override if you actually have IB. |
-| `FREETOKEN_BANK_SHARE_DIR` | `/tmp/freetoken-banks-<port>` | File-backed `MAP_SHARED` expert banks (set automatically for TP>1) |
+| `FREETOKEN_BANK_SHARE_DIR` | `$HOME/.cache/freetoken/banks-1919` | File-backed `MAP_SHARED` expert banks. Default is `$XDG_CACHE_HOME/freetoken/banks-{port}` (or `~/.cache/...`), **not** `/tmp` (tmpfs). Must be a disk with ≥137.1 GiB free for DSV4. |
 | `FREETOKEN_BANK_SHARE` | `0` | Disable shared banks (each rank anonymous-mmaps the full pool — likely OOM on 192 GB) |
 
 ```bash
@@ -81,6 +81,10 @@ ft gpu
 
 A Ryzen 9 9950X iGPU (`AMD Radeon Graphics` / `gfx1036`) is hidden so it does
 not become device 0. Strix Halo is **not** hidden.
+
+A **CUDA PyTorch wheel + NVIDIA dGPU + that AMD iGPU** stays the NVIDIA CUDA
+path (`Vendor.NVIDIA`). `CUDA_ON_AMD` is only when the CUDA wheel would run on
+a **discrete** AMD GPU after iGPU hide.
 
 ## DeepSeek-V4-Flash-0731 (one R9700, experts in host RAM)
 
@@ -104,6 +108,10 @@ ft serve --model deepseek-ai/DeepSeek-V4-Flash-0731 \
   --attention-backend triton \
   --cuda-graph-max-bs 0
 ```
+
+Optional one-card trade: `--kv-reserve-tokens` raises the KV floor versus the
+GPU expert-slot cache (`--moe-cache-auto`). That reserve is **per card**, not a
+system-wide window.
 
 `--gpu 0` if `ft gpu` still lists the iGPU. If HIP init hangs, see
 [ROCm#6630](https://github.com/ROCm/ROCm/issues/6630) (2026-08-28 RDNA4 bring-up);
@@ -129,18 +137,24 @@ If PCIe P2P misbehaves on this SKU, you may try `NCCL_P2P_DISABLE=1` (shared
 memory fallback). This tree only auto-sets `NCCL_IB_DISABLE=1` when unset.
 
 Expert banks: TP>1 maps one file-backed pool under
-`/tmp/freetoken-banks-<server-port>` so two processes do not each hold
-~137 GiB. Both ranks still *read* the checkpoint (rank-0-only fill is leftover).
-The FTW `HostBank()` constructor path is still per-process anonymous mmap.
+`$XDG_CACHE_HOME/freetoken/banks-{port}` (or `~/.cache/freetoken/banks-{port}`),
+**not** `/tmp` (systemd `/tmp` is often tmpfs at ~50% RAM). Launch fails if that
+filesystem is tmpfs or has less than the pool free. Export
+`FREETOKEN_BANK_SHARE_DIR` to a real disk. Both ranks still *read* the
+checkpoint (rank-0-only fill is leftover). FTW `HostBank()` still
+anonymous-mmaps **2×137 GiB** on TP=2.
 
 DSV4 / MLA in this slice: **replicated** resident `Linear` + full Triton
-`n_heads`. MoE experts already live in the shared host banks; each rank keeps
-its own GPU expert-slot cache and KV. Dual-card does **not** yet shard DSV4
-attention/dense. Models that already use `LinearOProj` / `LinearRowParallel`
-(Llama, Qwen, …) all-reduce through `TorchDistributedImpl` on HIP.
+`n_heads`. KV is a **per-rank** `DSV4PagedKVCache` — dual-card does **not**
+shard KV across 64 GB. 128k context is **not** enabled by `--gpu 0,1`. Each
+32 GB card must still hold its own KV. Models that already use `LinearOProj` /
+`LinearRowParallel` (Llama, Qwen, …) all-reduce through `TorchDistributedImpl`
+on HIP.
 
 ```bash
 export FREETOKEN_GFX_ARCH=gfx1201
+# Disk, not tmpfs /tmp. {port} matches --port (default 1919).
+export FREETOKEN_BANK_SHARE_DIR="$HOME/.cache/freetoken/banks-1919"
 # Optional: NCCL_DEBUG=INFO
 ft gpu   # two R9700s; Granite Ridge hidden; tp_discrete: 2
 ft serve --model deepseek-ai/DeepSeek-V4-Flash-0731 \
@@ -148,10 +162,12 @@ ft serve --model deepseek-ai/DeepSeek-V4-Flash-0731 \
   --attention-backend triton \
   --cuda-graph-max-bs 0 \
   --gpu 0,1 \
-  --max-seq-len-override 131072 \
-  --kv-reserve-tokens 131072 \
   --moe-cache-auto
 ```
+
+Do **not** add `--max-seq-len-override 131072 --kv-reserve-tokens 131072` to
+this dual-card command expecting a TP-split 128k window. Those flags are a
+**per-card** KV floor; 128k still has to fit on one 32 GB R9700.
 
 If RCCL or a second discrete GPU is missing, launch exits with a precise list
 (no CUDA-symbol crash). On this cloud VM that list is expected.
@@ -200,7 +216,7 @@ ft serve --model <moe-or-gguf> --moe-backend offload --attention-backend triton 
 4. DSV4-Flash-0731 one-card checklist above.
 5. Optional: `FREETOKEN_HIP_GRAPH_REPLAY=1` — report whether graph replay is
    stable on **Linux** gfx1201 (Windows #82 said no for MoE).
-6. Dual-card checklist above (`--gpu 0,1`, 128k reserve, shared banks).
+6. Dual-card checklist above (`--gpu 0,1`, disk `FREETOKEN_BANK_SHARE_DIR`, shared banks). KV is per-card; dual TP does not unlock 128k.
 
 ## Adding another gfx
 
@@ -227,5 +243,6 @@ the same failure modes against **this** source and implements Linux HIP here.
 
 ## NVIDIA
 
-Unchanged. `uv pip install -e ".[accel]"` still resolves cu130 torch. AMD is
-additive.
+Unchanged. `uv pip install -e ".[accel]"` still resolves cu130 torch. A CUDA
+wheel on a box whose only AMD PCI device is the 9950X iGPU stays
+`Vendor.NVIDIA`. AMD HIP is additive.
