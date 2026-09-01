@@ -3,9 +3,9 @@
 Native HIP backend for this fork. **ZLUDA is not supported**
 ([FlashML-org/FreeToken#60](https://github.com/FlashML-org/FreeToken/issues/60)).
 
-First-class target: **Linux x86_64, AMD Radeon AI PRO R9700, RDNA 4, `gfx1201`**.
-This slice adds **one-card DeepSeek-V4-Flash-0731** (`--moe-backend offload`).
-Dual-card TP remains leftover.
+First-class target: **Linux x86_64, 2× AMD Radeon AI PRO R9700, RDNA 4, `gfx1201`**.
+One-card DSV4-Flash HIP+Triton already landed. This slice adds **dual-card TP /
+RCCL wiring** (`--gpu 0,1`). Dual-card e2e on the R9700 box is leftover.
 
 This cloud / CI environment does **not** have an R9700. The checks below that
 need a GPU must be run on the workstation. Nothing in this document invents
@@ -15,12 +15,15 @@ tok/s or unpublished numbers. **R9700 tok/s is not published.**
 
 | Works in-tree (additive; NVIDIA CUDA path unchanged) | Leftover / on-box only |
 |---|---|
-| Detect AMD vs NVIDIA (`ft gpu`); hide Granite Ridge iGPU | Dual-card TP / RCCL not validated |
+| Detect AMD vs NVIDIA (`ft gpu`); hide Granite Ridge iGPU so TP ranks are the two R9700s | Dual-card **e2e** on 2× R9700 (this VM has no AMD GPU) |
 | HIP JIT of tvm-ffi kernels (`index`, `store`, `fast_index_copy`, …) for `gfx1201` | Vulkan (community: the hard problem) |
-| HIP `host_register` / `device_ptr` (#122 TDR fix) | Full e2e on R9700 (must run locally) |
+| HIP `host_register` / `device_ptr` (#122 TDR fix) | Full one-card e2e on R9700 (must run locally) |
 | HIP attention: `triton` aliases `dsv4_sparse` / `dsa` / `m3_sparse` / `qsa_sparse` (already Triton; no flashinfer/sgl cubins) | Native HIP FP8 tensor cores (e4m3 **emulated** unless `FREETOKEN_HIP_E4M3_NATIVE=1`) |
 | GGUF HIP compile (`-DUSE_ROCM`, `--offload-arch`) + rocThrust shim | gfx1201 HIP **graph replay** (TDR on Windows #82) |
 | MoE `offload` / `fused` / `cpu` with Triton experts; DSV4 `ds_fp4` host banks | `--moe-backend hybrid`; Windows ROCm |
+| `--gpu 0,1` infers TP=2; HIP uses **RCCL** (`torch.distributed` backend `rccl` or the ROCm `nccl` alias). PyNCCL / NCCL 2.27 is NVIDIA-only and fails loudly on HIP | RCCL P2P / dual-card generate on this SKU (vLLM RCCL was reported fragile; not claimed here) |
+| Shared file-backed expert banks (`FREETOKEN_BANK_SHARE_DIR`) so TP ranks do not each mmap ~137 GiB | Rank-0-only bank fill (both ranks still read the checkpoint); FTW `HostBank()` path is still per-process |
+| Dense models that already call `LinearOProj` / `LinearRowParallel` all-reduce via `TorchDistributedImpl` on HIP | DSV4 `Linear` / MLA head **sharding** (today: replicate resident weights + full Triton `n_heads`) |
 
 Default on `gfx1201`: `--cuda-graph-max-bs 0` unless you set
 `FREETOKEN_HIP_GRAPH_REPLAY=1`. That is conservative — Linux replay on this SKU
@@ -65,6 +68,9 @@ is AMD and the vars are unset):
 | `FREETOKEN_SKIP_CUDA_EXT` | `1` | skip install-time C++ ext; HIP ctypes fallback still registers host memory |
 | `FREETOKEN_GPU_VENDOR` | `amd` | force vendor in tests / odd wheels |
 | `FREETOKEN_HIP_E4M3_NATIVE` | `1` | try Triton native fp8e4nv on HIP (default: emulate) |
+| `NCCL_IB_DISABLE` | `1` (auto on HIP TP>1 if unset) | RCCL still reads `NCCL_*` names. Dual-card desktops have no InfiniBand; leaving IB on can stall init. Override if you actually have IB. |
+| `FREETOKEN_BANK_SHARE_DIR` | `/tmp/freetoken-banks-<port>` | File-backed `MAP_SHARED` expert banks (set automatically for TP>1) |
+| `FREETOKEN_BANK_SHARE` | `0` | Disable shared banks (each rank anonymous-mmaps the full pool — likely OOM on 192 GB) |
 
 ```bash
 ft gpu
@@ -103,6 +109,62 @@ ft serve --model deepseek-ai/DeepSeek-V4-Flash-0731 \
 [ROCm#6630](https://github.com/ROCm/ROCm/issues/6630) (2026-08-28 RDNA4 bring-up);
 collect `rocminfo` / `dmesg` and stay on eager + `triton`.
 
+## Dual-card TP / RCCL (2× R9700)
+
+`--gpu 0,1` with default `--tp-size 1` now means **TP=2**. The parent process
+hides Granite Ridge (`gfx1036`) before workers spawn, so those indices are the
+two discrete cards (`ft gpu` / `tp_discrete`), not the 9950X iGPU.
+
+HIP never loads PyNCCL (`pynccl.cu` / `-lnccl` / NCCL 2.27
+`ncclMemAlloc` / `ncclCommWindowRegister`). That plugin is NVIDIA-only and
+raises if a HIP process reaches it. AMD TP uses `torch.distributed` with
+backend **`rccl`** when the ROCm wheel exposes it, otherwise the ROCm alias
+still named **`nccl`** (that build links RCCL). The CPU group stays **gloo**
+(memory sync / scheduler). NVIDIA `--disable-pynccl` (real NCCL world + gloo)
+and the default PyNCCL path are unchanged.
+
+RCCL install: it ships with the **ROCm PyTorch wheel**. There is no separate
+`pip install rccl`. Optional debug (not set by FreeToken): `NCCL_DEBUG=INFO`.
+If PCIe P2P misbehaves on this SKU, you may try `NCCL_P2P_DISABLE=1` (shared
+memory fallback). This tree only auto-sets `NCCL_IB_DISABLE=1` when unset.
+
+Expert banks: TP>1 maps one file-backed pool under
+`/tmp/freetoken-banks-<server-port>` so two processes do not each hold
+~137 GiB. Both ranks still *read* the checkpoint (rank-0-only fill is leftover).
+The FTW `HostBank()` constructor path is still per-process anonymous mmap.
+
+DSV4 / MLA in this slice: **replicated** resident `Linear` + full Triton
+`n_heads`. MoE experts already live in the shared host banks; each rank keeps
+its own GPU expert-slot cache and KV. Dual-card does **not** yet shard DSV4
+attention/dense. Models that already use `LinearOProj` / `LinearRowParallel`
+(Llama, Qwen, …) all-reduce through `TorchDistributedImpl` on HIP.
+
+```bash
+export FREETOKEN_GFX_ARCH=gfx1201
+# Optional: NCCL_DEBUG=INFO
+ft gpu   # two R9700s; Granite Ridge hidden; tp_discrete: 2
+ft serve --model deepseek-ai/DeepSeek-V4-Flash-0731 \
+  --moe-backend offload \
+  --attention-backend triton \
+  --cuda-graph-max-bs 0 \
+  --gpu 0,1 \
+  --max-seq-len-override 131072 \
+  --kv-reserve-tokens 131072 \
+  --moe-cache-auto
+```
+
+If RCCL or a second discrete GPU is missing, launch exits with a precise list
+(no CUDA-symbol crash). On this cloud VM that list is expected.
+
+### Dual-card leftover (run on the box — not faked here)
+
+1. `ft gpu`: two `gfx1201` R9700s; iGPU hidden; `tp_discrete: 2`.
+2. Command above reaches READY (RCCL init, no PyNCCL/NCCL 2.27, no flashinfer).
+3. One short `chat/completions` (`max_tokens=16`) — leftover until you run it.
+4. Watch host RAM: one ~137 GiB pool, not two. Free RAM ≳ 160 GB before load.
+5. Do **not** record tok/s. **R9700 tok/s is not published.**
+6. If RCCL P2P hangs, try `NCCL_P2P_DISABLE=1` and report; that is leftover.
+
 ### One-card checklist (R9700 — not faked in CI)
 
 1. `ft gpu`: one R9700 `gfx1201`; Granite Ridge iGPU hidden.
@@ -138,7 +200,7 @@ ft serve --model <moe-or-gguf> --moe-backend offload --attention-backend triton 
 4. DSV4-Flash-0731 one-card checklist above.
 5. Optional: `FREETOKEN_HIP_GRAPH_REPLAY=1` — report whether graph replay is
    stable on **Linux** gfx1201 (Windows #82 said no for MoE).
-6. Optional second card: `--gpu 0,1` / TP — leftover, say what happened.
+6. Dual-card checklist above (`--gpu 0,1`, 128k reserve, shared banks).
 
 ## Adding another gfx
 
