@@ -22,7 +22,7 @@ tok/s or unpublished numbers. **R9700 tok/s is not published.**
 | GGUF HIP compile (`-DUSE_ROCM`, `--offload-arch`) + rocThrust shim | gfx1201 HIP **graph replay** (TDR on Windows #82) |
 | MoE `offload` / `fused` / `cpu` with Triton experts; DSV4 `ds_fp4` host banks | `--moe-backend hybrid`; Windows ROCm |
 | `--gpu 0,1` infers TP=2; HIP uses **RCCL** (`torch.distributed` backend `rccl` or the ROCm `nccl` alias). PyNCCL / NCCL 2.27 is NVIDIA-only and fails loudly on HIP | RCCL P2P / dual-card generate on this SKU (vLLM RCCL was reported fragile; not claimed here) |
-| Shared file-backed expert banks (`FREETOKEN_BANK_SHARE_DIR`, default `$XDG_CACHE_HOME/freetoken/banks-{port}` / `~/.cache/...` — **not** `/tmp`) | Rank-0-only bank fill; FTW `HostBank()` still anonymous-mmaps **2×137 GiB** on TP=2 |
+| Shared expert banks on TP>1: one **shmem (`memfd`) pool** created by rank 0, mapped `MAP_SHARED` by every rank (paths handed over on the gloo CPU group). Needs `amdgpu no_system_mem_limit=1` (below) | Rank-0-only bank fill (both ranks still read the checkpoint); FTW `HostBank()` still anonymous-mmaps **2×137 GiB** on TP=2 |
 | Dense models that already call `LinearOProj` / `LinearRowParallel` all-reduce via `TorchDistributedImpl` on HIP | DSV4 `Linear` / MLA head **sharding** (today: replicate resident weights + full Triton `n_heads`) |
 
 Default on `gfx1201`: `--cuda-graph-max-bs 0` unless you set
@@ -69,8 +69,7 @@ is AMD and the vars are unset):
 | `FREETOKEN_GPU_VENDOR` | `amd` | force vendor in tests / odd wheels |
 | `FREETOKEN_HIP_E4M3_NATIVE` | `1` | try Triton native fp8e4nv on HIP (default: emulate) |
 | `NCCL_IB_DISABLE` | `1` (auto on HIP TP>1 if unset) | RCCL still reads `NCCL_*` names. Dual-card desktops have no InfiniBand; leaving IB on can stall init. Override if you actually have IB. |
-| `FREETOKEN_BANK_SHARE_DIR` | `$HOME/.cache/freetoken/banks-1919` | File-backed `MAP_SHARED` expert banks. Default is `$XDG_CACHE_HOME/freetoken/banks-{port}` (or `~/.cache/...`), **not** `/tmp` (tmpfs). Must be a disk with ≥137.1 GiB free for DSV4. |
-| `FREETOKEN_BANK_SHARE` | `0` | Disable shared banks (each rank anonymous-mmaps the full pool — likely OOM on 192 GB) |
+| `FREETOKEN_BANK_SHARE` | `0` | Disable the TP>1 shared pool (each rank anonymous-mmaps the full pool — likely OOM on 192 GB) |
 
 ```bash
 ft gpu
@@ -136,13 +135,37 @@ RCCL install: it ships with the **ROCm PyTorch wheel**. There is no separate
 If PCIe P2P misbehaves on this SKU, you may try `NCCL_P2P_DISABLE=1` (shared
 memory fallback). This tree only auto-sets `NCCL_IB_DISABLE=1` when unset.
 
-Expert banks: TP>1 maps one file-backed pool under
-`$XDG_CACHE_HOME/freetoken/banks-{port}` (or `~/.cache/freetoken/banks-{port}`),
-**not** `/tmp` (systemd `/tmp` is often tmpfs at ~50% RAM). Launch fails if that
-filesystem is tmpfs or has less than the pool free. Export
-`FREETOKEN_BANK_SHARE_DIR` to a real disk. Both ranks still *read* the
-checkpoint (rank-0-only fill is leftover). FTW `HostBank()` still
-anonymous-mmaps **2×137 GiB** on TP=2.
+Expert banks: TP>1 maps **one shmem pool** (`memfd_create`; rank 0 creates every
+bank and broadcasts its `/proc/<pid>/fd/<n>` paths over the gloo CPU group, the
+other ranks open them `MAP_SHARED`). The pool is RAM: `MemAvailable` must cover
+it (~137.1 GiB for DSV4-Flash-0731) and it stays resident once pinned.
+
+Two things that do **not** work, both measured on 2×R9700 / ROCm 7.14:
+
+* A **disk-backed** shared pool (`MAP_SHARED` file on ext4 + `hipHostRegister`).
+  On ROCm the registration is a KFD SVM range; the writeback flusher then
+  write-protects the dirty pages, every `page_mkclean` is an MMU-notifier
+  invalidation, KFD evicts the range and **quiesces the process's GPU queues**,
+  the restore re-faults the pages dirty, and the cycle never converges
+  (`dmesg`: `svm_range_restore_work [amdgpu] hogged CPU`, counts doubling). The
+  DSV4 load wedged at shard 9/43 with both ranks in `futex_do_wait`. shmem never
+  goes through writeback, so the storm cannot start. `/dev/shm` is not used
+  either: its mount is capped at 50% of RAM.
+* The default **KFD resident-system-memory budget** (`≈ MemTotal − MemTotal/64`,
+  ~169 GiB on 172 GiB). Every rank's `hipHostRegister` of the pool is charged
+  against that one global counter, so 2 × 137 GiB fails the second rank's pins
+  partway through the load (`dmesg`: `SVM mapping failed, exceeds resident
+  system memory limit`). The pages are physically shared; the accounting is
+  double counting. Disable the limit before a dual-card DSV4 serve — the engine
+  preflight refuses to start otherwise:
+
+  ```bash
+  echo Y | sudo tee /sys/module/amdgpu/parameters/no_system_mem_limit     # now
+  echo 'options amdgpu no_system_mem_limit=1' | sudo tee /etc/modprobe.d/freetoken-kfd.conf  # after reboot
+  ```
+
+Both ranks still *read* the checkpoint (rank-0-only fill is leftover). FTW
+`HostBank()` still anonymous-mmaps **2×137 GiB** on TP=2.
 
 DSV4 / MLA in this slice: **replicated** resident `Linear` + full Triton
 `n_heads`. KV is a **per-rank** `DSV4PagedKVCache` — dual-card does **not**
@@ -153,8 +176,7 @@ on HIP.
 
 ```bash
 export FREETOKEN_GFX_ARCH=gfx1201
-# Disk, not tmpfs /tmp. {port} matches --port (default 1919).
-export FREETOKEN_BANK_SHARE_DIR="$HOME/.cache/freetoken/banks-1919"
+# TP>1 shared expert pool is shmem (RAM); needs amdgpu no_system_mem_limit=1 (see above).
 # Optional: NCCL_DEBUG=INFO
 ft gpu   # two R9700s; Granite Ridge hidden; tp_discrete: 2
 ft serve --model deepseek-ai/DeepSeek-V4-Flash-0731 \
@@ -216,7 +238,7 @@ ft serve --model <moe-or-gguf> --moe-backend offload --attention-backend triton 
 4. DSV4-Flash-0731 one-card checklist above.
 5. Optional: `FREETOKEN_HIP_GRAPH_REPLAY=1` — report whether graph replay is
    stable on **Linux** gfx1201 (Windows #82 said no for MoE).
-6. Dual-card checklist above (`--gpu 0,1`, disk `FREETOKEN_BANK_SHARE_DIR`, shared banks). KV is per-card; dual TP does not unlock 128k.
+6. Dual-card checklist above (`--gpu 0,1`, `no_system_mem_limit=1`, shared shmem banks). KV is per-card; dual TP does not unlock 128k.
 
 ## Adding another gfx
 
