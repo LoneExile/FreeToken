@@ -23,7 +23,7 @@ tok/s or unpublished numbers. **R9700 tok/s is not published.**
 | MoE `offload` / `fused` / `cpu` with Triton experts; DSV4 `ds_fp4` host banks | `--moe-backend hybrid`; Windows ROCm |
 | `--gpu 0,1` infers TP=2; HIP uses **RCCL** (`torch.distributed` backend `rccl` or the ROCm `nccl` alias). PyNCCL / NCCL 2.27 is NVIDIA-only and fails loudly on HIP | RCCL P2P / dual-card generate on this SKU (vLLM RCCL was reported fragile; not claimed here) |
 | Shared expert banks on TP>1: one **shmem (`memfd`) pool** created by rank 0, mapped `MAP_SHARED` by every rank (paths handed over on the gloo CPU group). Needs `amdgpu no_system_mem_limit=1` (below) | Rank-0-only bank fill (both ranks still read the checkpoint); FTW `HostBank()` still anonymous-mmaps **2×137 GiB** on TP=2 |
-| Dense models that already call `LinearOProj` / `LinearRowParallel` all-reduce via `TorchDistributedImpl` on HIP | DSV4 `Linear` / MLA head **sharding** (today: replicate resident weights + full Triton `n_heads`) |
+| HIP `--moe-cache-auto` caps the **largest GPU bank tensor** (default 4 GiB / 45% of post-weight free) so `set_bank_sources` does not issue a 10.21 GiB `torch.empty` when 22 GiB is free. Host shmem banks stay registered; the GPU cache is active expert slots only. `FREETOKEN_HIP_MOE_MAX_BANK_GIB` overrides. NVIDIA auto-size unchanged. | Confirm on the R9700s that `set_bank_sources` now reaches READY (this VM has no AMD GPU) |
 
 Default on `gfx1201`: `--cuda-graph-max-bs 0` unless you set
 `FREETOKEN_HIP_GRAPH_REPLAY=1`. That is conservative — Linux replay on this SKU
@@ -70,6 +70,8 @@ is AMD and the vars are unset):
 | `FREETOKEN_HIP_E4M3_NATIVE` | `1` | try Triton native fp8e4nv on HIP (default: emulate) |
 | `NCCL_IB_DISABLE` | `1` (auto on HIP TP>1 if unset) | RCCL still reads `NCCL_*` names. Dual-card desktops have no InfiniBand; leaving IB on can stall init. Override if you actually have IB. |
 | `FREETOKEN_BANK_SHARE` | `0` | Disable the TP>1 shared pool (each rank anonymous-mmaps the full pool — likely OOM on 192 GB) |
+| `FREETOKEN_HIP_MOE_MAX_BANK_GIB` | `4` | Cap one HIP GPU slot-cache tensor (default 4 GiB = 512 DSV4 `gate_up_packed` slots). The 137 GiB expert pool stays in registered shmem. |
+| `FREETOKEN_HIP_MOE_MAX_BANK_FRAC` | `0.45` | Also cap that tensor to this fraction of current free VRAM. |
 
 ```bash
 ft gpu
@@ -191,13 +193,22 @@ Do **not** add `--max-seq-len-override 131072 --kv-reserve-tokens 131072` to
 this dual-card command expecting a TP-split 128k window. Those flags are a
 **per-card** KV floor; 128k still has to fit on one 32 GB R9700.
 
+`--moe-cache-auto` on HIP does **not** copy the 137 GiB shmem pool into VRAM.
+It sizes a GPU expert-slot cache so the largest bank tensor fits (default cap
+4 GiB / `FREETOKEN_HIP_MOE_MAX_BANK_GIB`). An earlier greedy plan tried a
+10.21 GiB `gate_up_packed` `torch.empty` with ~22 GiB free and died in
+`set_bank_sources`. Explicit `--moe-cache-size 512` is the same 2×256-expert
+floor if you want to pin it.
+
 If RCCL or a second discrete GPU is missing, launch exits with a precise list
 (no CUDA-symbol crash). On this cloud VM that list is expected.
 
 ### Dual-card leftover (run on the box — not faked here)
 
 1. `ft gpu`: two `gfx1201` R9700s; iGPU hidden; `tp_discrete: 2`.
-2. Command above reaches READY (RCCL init, no PyNCCL/NCCL 2.27, no flashinfer).
+2. Command above reaches READY: shmem banks pin, then `set_bank_sources` must
+   **not** request a ~10 GiB contiguous VRAM alloc. Re-run this on the R9700s
+   (not claimed here). RCCL init, no PyNCCL/NCCL 2.27, no flashinfer.
 3. One short `chat/completions` (`max_tokens=16`) — leftover until you run it.
 4. Watch host RAM: one ~137 GiB pool, not two. Free RAM ≳ 160 GB before load.
 5. Do **not** record tok/s. **R9700 tok/s is not published.**
