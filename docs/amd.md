@@ -21,7 +21,7 @@ tok/s or unpublished numbers. **R9700 tok/s is not published.**
 | HIP attention: `triton` aliases `dsv4_sparse` / `dsa` / `m3_sparse` / `qsa_sparse` (already Triton; no flashinfer/sgl cubins) | Native HIP FP8 tensor cores (e4m3 **emulated** unless `FREETOKEN_HIP_E4M3_NATIVE=1`) |
 | GGUF HIP compile (`-DUSE_ROCM`, `--offload-arch`) + rocThrust shim | gfx1201 HIP **graph replay** (TDR on Windows #82) |
 | MoE `offload` / `fused` / `cpu` with Triton experts; DSV4 `ds_fp4` host banks | `--moe-backend hybrid`; Windows ROCm |
-| `--gpu 0,1` infers TP=2; HIP uses **RCCL** (`torch.distributed` backend `rccl` or the ROCm `nccl` alias). PyNCCL / NCCL 2.27 is NVIDIA-only and fails loudly on HIP | RCCL P2P / dual-card generate on this SKU (vLLM RCCL was reported fragile; not claimed here) |
+| `--gpu 0,1` infers TP=2; HIP uses **RCCL** (`torch.distributed` backend `rccl` or the ROCm `nccl` alias). PyNCCL / NCCL 2.27 is NVIDIA-only and fails loudly on HIP. Dual-card DSV4 generate **proven on 2× R9700** (2026-09-02, checklist below) | Rank-0-only fill; RCCL P2P stability under long serves is only a ~2 h sample |
 | Shared expert banks on TP>1: one **shmem (`memfd`) pool** created by rank 0, mapped `MAP_SHARED` by every rank (paths handed over on the gloo CPU group). Needs `amdgpu no_system_mem_limit=1` (below) | Rank-0-only bank fill (both ranks still read the checkpoint); FTW `HostBank()` still anonymous-mmaps **2×137 GiB** on TP=2 |
 | Dense models that already call `LinearOProj` / `LinearRowParallel` all-reduce via `TorchDistributedImpl` on HIP | DSV4 `Linear` / MLA head **sharding** (today: replicate resident weights + full Triton `n_heads`) |
 
@@ -141,7 +141,7 @@ bank and broadcasts its `/proc/<pid>/fd/<n>` paths over the gloo CPU group, the
 other ranks open them `MAP_SHARED`). The pool is RAM: `MemAvailable` must cover
 it (~137.1 GiB for DSV4-Flash-0731) and it stays resident once pinned.
 
-Two things that do **not** work, both measured on 2×R9700 / ROCm 7.14:
+Five things that do **not** work, all measured on 2×R9700 / ROCm 7.14:
 
 * A **disk-backed** shared pool (`MAP_SHARED` file on ext4 + `hipHostRegister`).
   On ROCm the registration is a KFD SVM range; the writeback flusher then
@@ -173,6 +173,26 @@ Two things that do **not** work, both measured on 2×R9700 / ROCm 7.14:
   therefore leaves `expandable_segments` off on HIP; `PYTORCH_ALLOC_CONF` still
   wins if you set it yourself. Measured: 20 MiB × 1016 = 19.8 GiB, 256 MiB × 79 =
   19.8 GiB, 1 MiB × 2032 = 1.98 GiB; without the setting, 30 GiB of any size.
+* Triton 3.8 on gfx1201 **drops a `tl.atomic_add` whose mask is derived from a
+  `tl.histogram` result** (`mask=(le < E) & (h > 0)` compiles to no store; the
+  same kernel with `mask=le < E` is correct; `hist+store`, `hist+atomic` without
+  the derived predicate, `tl.range` fills and `tl.arange` scatters all pass).
+  `moe_align_block_size` had exactly that shape in `_fill_and_count`, and the
+  fused single-CTA kernel took a `tl.where(m_e & (nblk > 0), ...)` on a histogram
+  count, so every prompt of ≥ 128 tokens (T × top_k ≥ the 768-route grouped
+  prefill crossover, where the aligned layout is consumed) got `expert_ids`
+  uninitialised: garbage tokens or `HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION` on
+  both ranks. Neither the NVIDIA build nor the CPU tests could see it. The kernels
+  now write bins unconditionally (adding 0 is harmless) and reload block counts
+  from the cumsum scratch; `tests/moe/test_moe_align_hip.py` runs the kernel
+  against a torch reference on the real GPU (16/16 red on the old kernel).
+* A Triton **`@constexpr_function` that calls back into Python** (the e4m3
+  emulation gate read `os.environ` / the driver at compile time). ROCm Triton's
+  compile-time evaluator rejects it (`Unsupported function referenced:
+  _hip_forces_e4m3_emu`) on the *first kernel launch* — i.e. 12 minutes after a
+  load that succeeded. The gate is now resolved once at import
+  (`e4m3_compat.HIP_EMU`); a drift guard raises if the vendor/env flips after
+  import instead of silently compiling the wrong branch.
 
 Both ranks still *read* the checkpoint (rank-0-only fill is leftover). FTW
 `HostBank()` still anonymous-mmaps **2×137 GiB** on TP=2.
@@ -204,14 +224,14 @@ this dual-card command expecting a TP-split 128k window. Those flags are a
 If RCCL or a second discrete GPU is missing, launch exits with a precise list
 (no CUDA-symbol crash). On this cloud VM that list is expected.
 
-### Dual-card leftover (run on the box — not faked here)
+### Dual-card checklist — run on the box 2026-09-02 (2× R9700, ROCm 7.14, torch 2.11.0+rocm7.14.1)
 
-1. `ft gpu`: two `gfx1201` R9700s; iGPU hidden; `tp_discrete: 2`.
-2. Command above reaches READY (RCCL init, no PyNCCL/NCCL 2.27, no flashinfer).
-3. One short `chat/completions` (`max_tokens=16`) — leftover until you run it.
-4. Watch host RAM: one ~137 GiB pool, not two. Free RAM ≳ 160 GB before load.
-5. Do **not** record tok/s. **R9700 tok/s is not published.**
-6. If RCCL P2P hangs, try `NCCL_P2P_DISABLE=1` and report; that is leftover.
+1. `ft gpu`: two `gfx1201` R9700s; iGPU hidden; `tp_discrete: 2`. **Done.**
+2. Command above reaches READY (RCCL init, no PyNCCL/NCCL 2.27, no flashinfer). **Done**: 43/43 shards in ~12 min, READY, KV pool 64 128 tokens per card, 31.8 GiB VRAM used per card after init.
+3. `chat/completions` returns text. **Done**, and beyond `max_tokens=16`: correct answers on real prompts through 2 015 prompt tokens (needle-in-haystack at 564 tokens, 1 515-token prompts, `ignore_eos` 128-token decodes), multi-turn with radix-cache hits (128–1 024 cached tokens). Both P2P and the shmem banks held across ~2 h of requests.
+4. Host RAM: one ~137 GiB pool, not two (shmem 137 GiB, `MemAvailable` 161 → 30 GiB during load). Free RAM ≳ 160 GB before load — the serve script gates on it.
+5. tok/s: the numbers live in the harbor-sandboc `docs/model-speed.md` grid, measured client-side over streaming (this server returns no `timings`). They are bandwidth-bound by the RAM-resident expert design (TTFT ≈ 11 s at 165 prompt tokens, ≈ 2.8 tok/s decode at conc 1) and are **not** a GPU-compute figure for the R9700.
+6. RCCL P2P did not hang; `NCCL_P2P_DISABLE=1` was not needed.
 
 ### One-card checklist (R9700 — not faked in CI)
 
