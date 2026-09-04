@@ -291,16 +291,15 @@ def require_gpu() -> Vendor:
         raise RuntimeError(
             "This process loaded a CUDA PyTorch wheel but a discrete AMD GPU is "
             "visible (after iGPU hide). Native HIP is required (ZLUDA is not "
-            "supported — FlashML-org/FreeToken#60). Install a ROCm torch build "
-            "and see docs/amd.md. A CUDA wheel + NVIDIA dGPU + AMD iGPU is fine "
-            "(that stays the CUDA path)."
+            "supported — FlashML-org/FreeToken#60). Install a ROCm torch build. "
+            "A CUDA wheel + NVIDIA dGPU + AMD iGPU is fine (that stays the CUDA "
+            "path)."
         )
     if v is Vendor.NONE:
         raise RuntimeError(
             "No usable GPU backend: this process has neither a CUDA torch+NVIDIA "
             "driver nor a HIP/ROCm torch+AMD driver. On AMD, install a ROCm PyTorch "
-            "wheel (not the default cu130 extra) and see docs/amd.md. ZLUDA is not "
-            "supported."
+            "wheel (not the default cu130 extra). ZLUDA is not supported."
         )
     return v
 

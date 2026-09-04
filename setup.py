@@ -64,7 +64,7 @@ def _hip_runtime_paths() -> tuple[list[str], list[str], list[str]]:
     if home is None:
         raise RuntimeError(
             "ROCM_HOME / HIP_PATH / /opt/rocm is required to build the HIP "
-            "pinned-tensor extension. See docs/amd.md."
+            "pinned-tensor extension."
         )
     include_dirs = [str(home / "include")]
     library_dirs = [str(d) for d in (home / "lib", home / "lib64") if d.exists()]
@@ -74,7 +74,7 @@ def _hip_runtime_paths() -> tuple[list[str], list[str], list[str]]:
 def _ext_modules() -> list:
     # FREETOKEN_SKIP_CUDA_EXT skips the install-time C++ extensions on both
     # CUDA and HIP. The HIP host_register/device_ptr ctypes fallback in
-    # kernel/pinned.py still works (see docs/amd.md).
+    # kernel/pinned.py still works.
     if SKIP_CUDA_EXT:
         return []
 

@@ -39,8 +39,7 @@ skip unless `vllm` is importable (dedicated venv with `vllm>=0.14,<0.15`).
 
 AMD/HIP unit tests (`tests/runtime/test_gpu.py`, `tests/kernels/test_hip_compat.py`,
 `tests/kernels/test_pinned_hip_fallback.py`) are CPU-only mocks. They do **not**
-stand in for an R9700 e2e run — see [docs/amd.md](../docs/amd.md) for the on-box
-checklist. Do not treat a green CI as “we ran on gfx1201”.
+stand in for an R9700 e2e run. Do not treat a green CI as “we ran on gfx1201”.
 
 `needs_weights`-marked tests skip unless the env var pointing at a real local
 checkpoint is set:

@@ -138,7 +138,7 @@ def _resolve_auto_attention_backend(required: frozenset[AttnType]) -> str:
         raise RuntimeError(
             "No HIP attention backend can serve attention types "
             f"{sorted(t.value for t in required)}. The in-tree AMD path is "
-            "--attention-backend triton (see docs/amd.md). ZLUDA is not supported."
+            "--attention-backend triton. ZLUDA is not supported."
         )
 
     candidates: list[tuple[str, bool]] = []

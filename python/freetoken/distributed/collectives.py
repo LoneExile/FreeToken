@@ -44,7 +44,7 @@ def require_pynccl_allowed() -> None:
             hint=(
                 "On AMD use torch.distributed RCCL (backend 'rccl' or the ROCm "
                 "'nccl' alias). HIP never loads PyNCCL; do not pass a CUDA NCCL "
-                "plugin. See docs/amd.md."
+                "plugin."
             ),
         )
 

@@ -33,8 +33,7 @@ def _require_extension():
         raise ImportError(
             "freetoken.kernel._pinned_tensor is not installed. Reinstall FreeToken "
             "so the pinned tensor CUDA/HIP extension is built at install time, or "
-            "on AMD use the HIP ctypes fallback (host_register / device_ptr) "
-            "documented in docs/amd.md."
+            "on AMD use the HIP ctypes fallback (host_register / device_ptr)."
         )
     return ext
 
@@ -109,7 +108,7 @@ def host_register(addr: int, nbytes: int) -> None:
         return
     raise RuntimeError(
         "host_register requires the _pinned_tensor extension (NVIDIA) or a HIP "
-        "runtime (AMD). Reinstall FreeToken, or see docs/amd.md."
+        "runtime (AMD). Reinstall FreeToken."
     )
 
 
