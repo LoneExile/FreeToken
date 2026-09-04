@@ -4,6 +4,8 @@ import importlib.util
 import os
 from pathlib import Path
 
+import sys
+
 from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CUDA_HOME, CppExtension
 
@@ -112,7 +114,17 @@ def _ext_modules() -> list:
         extra_compile_args=compile_args + ["-pthread"],
         extra_link_args=extra_link,
     )
-    return [pinned, cpu_moe]
+    modules = [pinned, cpu_moe]
+    if sys.platform == "linux":
+        # --ple-backend disk row store; Linux-only until the TableFile/BatchReader seams grow Windows bodies
+        modules.append(
+            CppExtension(
+                name="freetoken.kernel._ple_store",
+                sources=["python/freetoken/kernel/csrc/ple_store/ple_store_ext.cpp"],
+                extra_compile_args=["-O3", "-std=c++17"],
+            )
+        )
+    return modules
 
 
 setup(
